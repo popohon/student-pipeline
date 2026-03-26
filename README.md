@@ -407,6 +407,3 @@ cross-dataset analysis, score heatmap by class × subject, and pipeline readines
 
 ---
 
-## Future Scaling
-
-See [LAKEHOUSE_FUTURE.md](LAKEHOUSE_FUTURE.md) for the migration path when data volume grows significantly.
