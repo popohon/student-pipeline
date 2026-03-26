@@ -1,0 +1,217 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Common Airflow config — shared by all Airflow services
+# ─────────────────────────────────────────────────────────────────────────────
+x-airflow-common: &airflow-common
+  build: ./docker/airflow
+  environment: &airflow-env
+    # Core
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__CORE__FERNET_KEY: 'zTTKW6SN7v6WFRv_uxHPFZFTHk1hI4F5RanZs8A3TiE='
+    # Database
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow_db
+    # Webserver
+    AIRFLOW__WEBSERVER__SECRET_KEY: 'onlenpajak_webserver_secret'
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: 'true'
+    # Scheduler
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+    # MinIO
+    MINIO_ENDPOINT: http://minio:9000
+    MINIO_ACCESS_KEY: minioadmin
+    MINIO_SECRET_KEY: minioadmin123
+    MINIO_BRONZE_BUCKET: bronze
+    MINIO_SILVER_BUCKET: silver
+    MINIO_REJECTED_BUCKET: rejected
+    # Gold DB
+    GOLD_DB_HOST: postgres
+    GOLD_DB_PORT: '5432'
+    GOLD_DB_NAME: gold_db
+    GOLD_DB_USER: gold
+    GOLD_DB_PASSWORD: gold
+    # Source data
+    SOURCE_DATA_PATH: /opt/airflow/data
+    # Python path
+    PYTHONPATH: /opt/airflow
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./scripts:/opt/airflow/scripts
+    - ./data:/opt/airflow/data
+    - airflow-logs:/opt/airflow/logs
+  depends_on:
+    postgres:
+      condition: service_healthy
+    minio:
+      condition: service_started   # no healthcheck on minio image (distroless)
+  networks:
+    - onlenpajak-net
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Services
+# ─────────────────────────────────────────────────────────────────────────────
+services:
+
+  # ─── PostgreSQL ─────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:15
+    container_name: onlenpajak-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./sql/init:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - onlenpajak-net
+
+  # ─── MinIO ──────────────────────────────────────────────────────────────────
+  minio:
+    image: minio/minio:RELEASE.2024-03-15T01-07-19Z
+    container_name: onlenpajak-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin123
+    volumes:
+      - minio-data:/data
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # Console UI
+    # No healthcheck: minio/minio uses a distroless Chainguard Wolfi base
+    # that ships with no curl, wget, or shell utilities.
+    # minio-init uses a retry loop to wait for the API to be ready instead.
+    networks:
+      - onlenpajak-net
+
+  # ─── MinIO bucket initializer ───────────────────────────────────────────────
+  minio-init:
+    image: minio/mc:RELEASE.2024-03-13T23-51-57Z
+    container_name: onlenpajak-minio-init
+    depends_on:
+      minio:
+        condition: service_started   # service_started because minio has no healthcheck
+    entrypoint: >
+      /bin/sh -c "
+        echo 'Waiting for MinIO API...';
+        until mc alias set local http://minio:9000 minioadmin minioadmin123 2>/dev/null; do
+          echo '  retrying in 3s...';
+          sleep 3;
+        done;
+        mc mb local/bronze   --ignore-existing;
+        mc mb local/silver   --ignore-existing;
+        mc mb local/rejected --ignore-existing;
+        echo '✓ MinIO buckets ready: bronze, silver, rejected';
+        exit 0;
+      "
+    networks:
+      - onlenpajak-net
+
+  # ─── Airflow — Init ─────────────────────────────────────────────────────────
+  airflow-init:
+    <<: *airflow-common
+    container_name: onlenpajak-airflow-init
+    # Use a list so Docker passes the bash script as a single -c argument,
+    # avoiding YAML multiline folding issues with the > scalar.
+    command:
+      - bash
+      - -c
+      - |
+          airflow db migrate &&
+          airflow users create \
+            --username admin \
+            --password admin \
+            --firstname Admin \
+            --lastname User \
+            --role Admin \
+            --email admin@onlenpajak.com &&
+          echo '✓ Airflow initialized'
+    restart: on-failure
+
+  # ─── Airflow — Webserver ─────────────────────────────────────────────────────
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: onlenpajak-airflow-webserver
+    command: webserver
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_started
+      airflow-init:
+        condition: service_completed_successfully
+    networks:
+      - onlenpajak-net
+
+  # ─── Airflow — Scheduler ─────────────────────────────────────────────────────
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: onlenpajak-airflow-scheduler
+    command: scheduler
+    healthcheck:
+      test: ["CMD-SHELL", "airflow jobs check --job-type SchedulerJob --hostname \"$${HOSTNAME}\""]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    networks:
+      - onlenpajak-net
+
+  # ─── Superset ────────────────────────────────────────────────────────────────
+  superset:
+    build: ./docker/superset
+    container_name: onlenpajak-superset
+    environment:
+      SUPERSET_SECRET_KEY: 'onlenpajak_superset_secret_key_2024'
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: '5432'
+      SUPERSET_DB_NAME: superset_db
+      SUPERSET_DB_USER: superset
+      SUPERSET_DB_PASSWORD: superset
+      GOLD_DB_NAME: gold_db
+      GOLD_DB_USER: gold
+      GOLD_DB_PASSWORD: gold
+    ports:
+      - "8088:8088"
+    volumes:
+      - superset-data:/app/superset_home
+      - ./docker/superset:/app/docker
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - onlenpajak-net
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Volumes & Network
+# ─────────────────────────────────────────────────────────────────────────────
+volumes:
+  postgres-data:
+  minio-data:
+  airflow-logs:
+  superset-data:
+
+networks:
+  onlenpajak-net:
+    driver: bridge

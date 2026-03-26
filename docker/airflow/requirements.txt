@@ -1,0 +1,19 @@
+# Object storage
+boto3==1.34.69
+minio==7.2.5
+
+# Columnar processing
+pyarrow==15.0.2
+duckdb==0.10.3
+
+# Data validation
+great-expectations==0.18.19
+# GE dependencies that may need pinning
+typing-extensions>=4.6.0
+scipy>=1.11.0
+
+# PostgreSQL
+psycopg2-binary==2.9.9
+
+# Data manipulation (used in validation fallback & silver_to_gold)
+pandas==2.2.1
