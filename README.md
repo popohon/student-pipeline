@@ -70,7 +70,7 @@ For the thought process please use this [link on notion](https://www.notion.so/T
 | Silver | attendance | 5,000 | **4,829** | Dedup 171 rows (PRESENT>ABSENT, latest) |
 | Silver | assessments | 3,000 | **2,985** | Dedup 15 rows (latest created_at), +normalized_score |
 | Gold | attendance+students | 4,829 | — | Enrich class_id via JOIN |
-| Gold | mart | — | ~N×10 | Aggregate class×date performance |
+| Gold | mart | — | ~500–600 rows | 1 row per (class_id, date) with any activity — 10 classes × ~55 active dates |
 
 ---
 
